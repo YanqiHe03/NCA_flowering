@@ -555,8 +555,22 @@ var perlinGpu = {
   fbo: null,
   tex: null,
   readback: null,
-  uniform: {}
+  uniform: {},
+  // Half-resolution render + bilinear upsample: the expensive fBm shader runs
+  // on lowW × lowH pixels (≈W*H/scale²), then an upsample pass bilinearly
+  // resamples to W × H before readback, so the existing fast/slow paths above
+  // consume the same W × H grid they always have.
+  lowFbo: null,
+  lowTex: null,
+  lowW: 0,
+  lowH: 0,
+  upProgram: null,
+  upUniform: {}
 };
+// Scale factor for the Perlin render pass. Higher = cheaper (shader work ÷ scale²)
+// at the cost of softer mask edges. Mask is sigmoid-filtered downstream so small
+// scales are visually indistinguishable. Set to 1 to disable and render at native res.
+var PERLIN_RENDER_SCALE = 2;
 
 function smoothstep(edge0, edge1, x) {
   if (x <= edge0) return 0;
@@ -680,18 +694,27 @@ function disposePerlinGpu() {
   if (!perlinGpu.gl) return;
   var gl = perlinGpu.gl;
   if (perlinGpu.program) gl.deleteProgram(perlinGpu.program);
+  if (perlinGpu.upProgram) gl.deleteProgram(perlinGpu.upProgram);
   if (perlinGpu.vao) gl.deleteVertexArray(perlinGpu.vao);
   if (perlinGpu.fbo) gl.deleteFramebuffer(perlinGpu.fbo);
   if (perlinGpu.tex) gl.deleteTexture(perlinGpu.tex);
+  if (perlinGpu.lowFbo) gl.deleteFramebuffer(perlinGpu.lowFbo);
+  if (perlinGpu.lowTex) gl.deleteTexture(perlinGpu.lowTex);
   perlinGpu.ready = false;
   perlinGpu.canvas = null;
   perlinGpu.gl = null;
   perlinGpu.program = null;
+  perlinGpu.upProgram = null;
   perlinGpu.vao = null;
   perlinGpu.fbo = null;
   perlinGpu.tex = null;
+  perlinGpu.lowFbo = null;
+  perlinGpu.lowTex = null;
+  perlinGpu.lowW = 0;
+  perlinGpu.lowH = 0;
   perlinGpu.readback = null;
   perlinGpu.uniform = {};
+  perlinGpu.upUniform = {};
 }
 
 function initPerlinGpu() {
@@ -842,6 +865,61 @@ function initPerlinGpu() {
     return false;
   }
 
+  // Optional half-resolution render pass. When PERLIN_RENDER_SCALE > 1 the
+  // expensive fBm shader runs on a smaller FBO and a second program upsamples
+  // it bilinearly into `tex` (W × H) just before readback — so the rest of the
+  // pipeline is unchanged. If the setup fails we fall back to the single-pass
+  // native-resolution path already built above.
+  var scale = Math.max(1, PERLIN_RENDER_SCALE | 0);
+  var lowW = Math.max(1, Math.ceil(W / scale));
+  var lowH = Math.max(1, Math.ceil(H / scale));
+  var upProgram = null, lowTex = null, lowFbo = null;
+  if (scale > 1) {
+    try {
+      var upFsSrc = [
+        '#version 300 es',
+        'precision highp float;',
+        'out vec4 fragColor;',
+        'uniform sampler2D uSrc;',
+        'uniform vec2 uSrcSize;',
+        'uniform vec2 uDstSize;',
+        'void main(){',
+        // Manual bilinear so we do not depend on OES_texture_float_linear.
+        '  vec2 srcCoord = gl_FragCoord.xy * uSrcSize / uDstSize;',
+        '  vec2 s = srcCoord - 0.5;',
+        '  vec2 ip = floor(s);',
+        '  vec2 f = s - ip;',
+        '  vec2 inv = 1.0 / uSrcSize;',
+        '  vec2 uv00 = (ip + 0.5) * inv;',
+        '  vec2 uv11 = (ip + 1.5) * inv;',
+        '  vec4 c00 = texture(uSrc, vec2(uv00.x, uv00.y));',
+        '  vec4 c10 = texture(uSrc, vec2(uv11.x, uv00.y));',
+        '  vec4 c01 = texture(uSrc, vec2(uv00.x, uv11.y));',
+        '  vec4 c11 = texture(uSrc, vec2(uv11.x, uv11.y));',
+        '  fragColor = mix(mix(c00, c10, f.x), mix(c01, c11, f.x), f.y);',
+        '}'
+      ].join('\n');
+      upProgram = createProgram(gl, vsSrc, upFsSrc);
+      lowTex = gl.createTexture();
+      gl.bindTexture(gl.TEXTURE_2D, lowTex);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+      gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA32F, lowW, lowH, 0, gl.RGBA, gl.FLOAT, null);
+      lowFbo = gl.createFramebuffer();
+      gl.bindFramebuffer(gl.FRAMEBUFFER, lowFbo);
+      gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, lowTex, 0);
+      var lowOk = gl.checkFramebufferStatus(gl.FRAMEBUFFER) === gl.FRAMEBUFFER_COMPLETE;
+      gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+      if (!lowOk) throw new Error('low-res FBO incomplete');
+    } catch (e) {
+      if (upProgram) { gl.deleteProgram(upProgram); upProgram = null; }
+      if (lowFbo) { gl.deleteFramebuffer(lowFbo); lowFbo = null; }
+      if (lowTex) { gl.deleteTexture(lowTex); lowTex = null; }
+    }
+  }
+
   perlinGpu.ready = true;
   perlinGpu.canvas = c;
   perlinGpu.gl = gl;
@@ -849,6 +927,11 @@ function initPerlinGpu() {
   perlinGpu.vao = vao;
   perlinGpu.fbo = fbo;
   perlinGpu.tex = tex;
+  perlinGpu.lowFbo = lowFbo;
+  perlinGpu.lowTex = lowTex;
+  perlinGpu.lowW = lowFbo ? lowW : W;
+  perlinGpu.lowH = lowFbo ? lowH : H;
+  perlinGpu.upProgram = upProgram;
   perlinGpu.readback = new Float32Array(W * H * 4);
   perlinGpu.uniform = {
     resolution: gl.getUniformLocation(program, 'uResolution'),
@@ -863,6 +946,11 @@ function initPerlinGpu() {
     refSpan: gl.getUniformLocation(program, 'uRefSpan'),
     phase: gl.getUniformLocation(program, 'uPhase')
   };
+  perlinGpu.upUniform = upProgram ? {
+    src: gl.getUniformLocation(upProgram, 'uSrc'),
+    srcSize: gl.getUniformLocation(upProgram, 'uSrcSize'),
+    dstSize: gl.getUniformLocation(upProgram, 'uDstSize')
+  } : {};
   return true;
 }
 
@@ -871,11 +959,18 @@ function computeBaseWeightsGPU() {
   try {
     var gl = perlinGpu.gl;
     var u = perlinGpu.uniform;
-    gl.bindFramebuffer(gl.FRAMEBUFFER, perlinGpu.fbo);
-    gl.viewport(0, 0, W, H);
+    var useLow = !!(perlinGpu.lowFbo && perlinGpu.upProgram);
+    var renderW = useLow ? perlinGpu.lowW : W;
+    var renderH = useLow ? perlinGpu.lowH : H;
+    var refSpan = noiseSpaceRef();
+    // Render Perlin pass — full resolution by default, or a smaller FBO when
+    // low-res + upsample is active. `uRefSpan` is scaled so the noise field
+    // stays identical in world space regardless of render resolution.
+    gl.bindFramebuffer(gl.FRAMEBUFFER, useLow ? perlinGpu.lowFbo : perlinGpu.fbo);
+    gl.viewport(0, 0, renderW, renderH);
     gl.useProgram(perlinGpu.program);
     gl.bindVertexArray(perlinGpu.vao);
-    gl.uniform2f(u.resolution, W, H);
+    gl.uniform2f(u.resolution, renderW, renderH);
     gl.uniform2f(u.offset, noiseOffsetX, noiseOffsetY);
     gl.uniform1f(u.noiseScale, noiseScale);
     gl.uniform1f(u.noiseTime, noiseTime);
@@ -884,7 +979,7 @@ function computeBaseWeightsGPU() {
     gl.uniform1f(u.maskThreshold, Math.max(0.02, Math.min(0.98, maskThreshold)));
     gl.uniform1f(u.maskEdgeSharpness, Math.max(0.5, Math.min(50, maskEdgeSharpness)));
     gl.uniform1f(u.octaves, Math.max(1, Math.min(14, noiseOctaves)));
-    gl.uniform1f(u.refSpan, noiseSpaceRef());
+    gl.uniform1f(u.refSpan, useLow ? refSpan * (renderW / W) : refSpan);
     var pu = perlinPhaseUpload;
     pu[0]  = LAYER_PHASE[0][0]; pu[1]  = LAYER_PHASE[0][1]; pu[2]  = LAYER_PHASE[0][2];
     pu[3]  = LAYER_PHASE[1][0]; pu[4]  = LAYER_PHASE[1][1]; pu[5]  = LAYER_PHASE[1][2];
@@ -892,6 +987,21 @@ function computeBaseWeightsGPU() {
     pu[9]  = LAYER_PHASE[3][0]; pu[10] = LAYER_PHASE[3][1]; pu[11] = LAYER_PHASE[3][2];
     gl.uniform3fv(u.phase, pu);
     gl.drawArrays(gl.TRIANGLES, 0, 3);
+
+    if (useLow) {
+      // Bilinear upsample pass: low-res texture → high-res FBO.
+      var uu = perlinGpu.upUniform;
+      gl.bindFramebuffer(gl.FRAMEBUFFER, perlinGpu.fbo);
+      gl.viewport(0, 0, W, H);
+      gl.useProgram(perlinGpu.upProgram);
+      gl.activeTexture(gl.TEXTURE0);
+      gl.bindTexture(gl.TEXTURE_2D, perlinGpu.lowTex);
+      gl.uniform1i(uu.src, 0);
+      gl.uniform2f(uu.srcSize, perlinGpu.lowW, perlinGpu.lowH);
+      gl.uniform2f(uu.dstSize, W, H);
+      gl.drawArrays(gl.TRIANGLES, 0, 3);
+    }
+
     gl.readPixels(0, 0, W, H, gl.RGBA, gl.FLOAT, perlinGpu.readback);
     gl.bindVertexArray(null);
     gl.bindFramebuffer(gl.FRAMEBUFFER, null);
@@ -1286,6 +1396,8 @@ async function initTF() {
 
 function initCanvas() {
   if (state) state.dispose();
+  if (disturbXs) { disturbXs.dispose(); disturbXs = null; }
+  if (disturbYs) { disturbYs.dispose(); disturbYs = null; }
   disposePerlinGpu();
   cachedNoise01 = new Float32Array(W * H);
   cachedQuartile = new Uint8Array(W * H);
@@ -1432,6 +1544,8 @@ function upscaleSimulation2x() {
     displayRgbBuf = new Float32Array(W * H * 3);
     maskDataBuf = null;
     maskDataBufLen = 0;
+    if (disturbXs) { disturbXs.dispose(); disturbXs = null; }
+    if (disturbYs) { disturbYs.dispose(); disturbYs = null; }
     state = tf.variable(resizedState);
     resizedState.dispose();
 
@@ -1963,22 +2077,23 @@ function ncaStep() {
     var rotated = tf.concat([pId, rotDx, rotDy, pLap], 4); // [1,H,W,CH,4]
     var perceived = rotated.reshape([1, H, W, CH * FILTER_N]);
 
-    var zeroDx = tf.zeros([1, H, W, CH]);
-    var total = totalModelCount();
-    var dxList = [];
-    for (var k = 0; k < BASE_MODELS; k++) {
-      dxList.push(baseModels[k] ? computeDx(perceived, baseModels[k]) : zeroDx);
-    }
-    for (var bi = 0; bi < brushModels.length; bi++) {
-      var bm = brushModels[bi];
-      dxList.push(bm.model ? computeDx(perceived, bm.model) : zeroDx);
-    }
     var qm = quartileMaskTensor;
-    var combinedDx = tf.mul(dxList[0], qm.slice([0, 0, 0, 0], [-1, -1, -1, 1]));
-    for (var mk = 1; mk < total; mk++) {
-      var ms = qm.slice([0, 0, 0, mk], [-1, -1, -1, 1]);
-      combinedDx = tf.add(combinedDx, tf.mul(dxList[mk], ms));
+    // Skip slots with no loaded model: because that slot's dx would be zero, its
+    // contribution (dx * mask_slot) is zero too, so dropping it is a no-op yet
+    // saves one mul + one add per missing slot.
+    var combinedDx = null;
+    var addContribution = function(channelIdx, model) {
+      if (!model) return;
+      var dx = computeDx(perceived, model);
+      var ms = qm.slice([0, 0, 0, channelIdx], [-1, -1, -1, 1]); // broadcasts over CH
+      var contrib = tf.mul(dx, ms);
+      combinedDx = (combinedDx === null) ? contrib : tf.add(combinedDx, contrib);
+    };
+    for (var k = 0; k < BASE_MODELS; k++) addContribution(k, baseModels[k]);
+    for (var bi = 0; bi < brushModels.length; bi++) {
+      addContribution(BASE_MODELS + bi, brushModels[bi].model);
     }
+    // countLoadedModels() > 0 was checked above, so combinedDx is non-null here.
 
     // Stochastic update (fire_rate = 0.5)
     var updateMask = tf.randomUniform([1, H, W, 1]).less(0.5);
@@ -2005,15 +2120,26 @@ function periodicPad(x, pad) {
 }
 
 // ====== Disturbance: clear a moving circle ======
+// Cached W×H coordinate grids — rebuilt in initCanvas/upscaleSimulation2x when W/H change.
+// Persisted across tf.tidy via tf.keep() when first created.
+var disturbXs = null; // [H, W] float32
+var disturbYs = null; // [H, W] float32
+
+function rebuildDisturbanceGrids() {
+  if (disturbXs) { disturbXs.dispose(); disturbXs = null; }
+  if (disturbYs) { disturbYs.dispose(); disturbYs = null; }
+  disturbXs = tf.keep(tf.range(0, W).reshape([1, W]).tile([H, 1]));
+  disturbYs = tf.keep(tf.range(0, H).reshape([H, 1]).tile([1, W]));
+}
+
 function applyDisturbance() {
+  if (!disturbXs || !disturbYs) rebuildDisturbanceGrids();
   tf.tidy(function() {
     var t = 2.0 * Date.now() / 1000.0;
     var cx = Math.sin(t * 2) * W / 3 + W / 2;
     var cy = Math.cos(t * 3.1) * H / 3 + H / 2;
     var r = 20;
-    var xs = tf.range(0, W).reshape([1, W]).tile([H, 1]);
-    var ys = tf.range(0, H).reshape([H, 1]).tile([1, W]);
-    var distSq = tf.add(tf.square(tf.sub(xs, cx)), tf.square(tf.sub(ys, cy)));
+    var distSq = tf.add(tf.square(tf.sub(disturbXs, cx)), tf.square(tf.sub(disturbYs, cy)));
     var keepMask = distSq.greater(r * r).expandDims(0).expandDims(-1);
     state.assign(tf.mul(state, tf.cast(keepMask, 'float32')));
   });
