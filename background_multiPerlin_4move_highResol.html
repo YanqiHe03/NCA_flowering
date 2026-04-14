@@ -383,6 +383,17 @@ var cachedQuartile = new Uint8Array(W * H); // dominant slot 0..(4+brush_n-1)
 var cachedMixR = new Float32Array(W * H);
 var cachedMixG = new Float32Array(W * H);
 var cachedMixB = new Float32Array(W * H);
+// Reusable buffers to avoid per-frame allocations.
+// Sized to W*H (or a multiple) and reallocated from initCanvas() when W/H change.
+var maskDataBuf = null;         // Float32Array(H*W*total) — mask upload scratch; total is dynamic so lazy-resize
+var maskDataBufLen = 0;         // current capacity of maskDataBuf (in floats)
+var maskPreviewBuf = null;      // Uint8ClampedArray(W*H*4) — noise preview pixels
+var maskPreviewImageData = null;// ImageData wrapping maskPreviewBuf
+var displayImgData = null;      // ImageData(W, H) — main canvas pixels
+var displayRgbBuf = null;       // Float32Array(W*H*3) — dataSync destination for RGB tensor
+var perlinPhaseUpload = new Float32Array(12); // uniform3fv(u.phase, ...) upload scratch
+var brushClaimsBuf = null;      // Float32Array(brushN) — grows lazily in buildMaskTensor
+var brushWeightsBuf = null;
 var renderFrame = 0;
 
 // Preview / overlay colors (match sidebar tags)
@@ -408,6 +419,9 @@ var drawOnCanvasEnabled = true;
 var isDrawingStroke = false;
 var lastDrawGx = -1, lastDrawGy = -1;
 var activeStrokeErase = false;
+// Coalesces multiple mousemove-driven mask rebuilds per frame into a single rebuild
+// executed at the start of the next render tick.
+var pendingMaskRebuild = false;
 // Brush mask evolution: multi-pass diffusion turns the binary stamp into
 // a continuous gradient field, then the same sigmoid as A-D produces soft edges.
 var drawLifeProgressStep = 0.0009;
@@ -871,12 +885,12 @@ function computeBaseWeightsGPU() {
     gl.uniform1f(u.maskEdgeSharpness, Math.max(0.5, Math.min(50, maskEdgeSharpness)));
     gl.uniform1f(u.octaves, Math.max(1, Math.min(14, noiseOctaves)));
     gl.uniform1f(u.refSpan, noiseSpaceRef());
-    gl.uniform3fv(u.phase, new Float32Array([
-      LAYER_PHASE[0][0], LAYER_PHASE[0][1], LAYER_PHASE[0][2],
-      LAYER_PHASE[1][0], LAYER_PHASE[1][1], LAYER_PHASE[1][2],
-      LAYER_PHASE[2][0], LAYER_PHASE[2][1], LAYER_PHASE[2][2],
-      LAYER_PHASE[3][0], LAYER_PHASE[3][1], LAYER_PHASE[3][2]
-    ]));
+    var pu = perlinPhaseUpload;
+    pu[0]  = LAYER_PHASE[0][0]; pu[1]  = LAYER_PHASE[0][1]; pu[2]  = LAYER_PHASE[0][2];
+    pu[3]  = LAYER_PHASE[1][0]; pu[4]  = LAYER_PHASE[1][1]; pu[5]  = LAYER_PHASE[1][2];
+    pu[6]  = LAYER_PHASE[2][0]; pu[7]  = LAYER_PHASE[2][1]; pu[8]  = LAYER_PHASE[2][2];
+    pu[9]  = LAYER_PHASE[3][0]; pu[10] = LAYER_PHASE[3][1]; pu[11] = LAYER_PHASE[3][2];
+    gl.uniform3fv(u.phase, pu);
     gl.drawArrays(gl.TRIANGLES, 0, 3);
     gl.readPixels(0, 0, W, H, gl.RGBA, gl.FLOAT, perlinGpu.readback);
     gl.bindVertexArray(null);
@@ -1013,8 +1027,15 @@ function buildMaskTensor() {
   ensurePerlinLayers();
   if (quartileMaskTensor) quartileMaskTensor.dispose();
   var total = totalModelCount();
-  var data = new Float32Array(H * W * total);
-  var imgBuf = new Uint8ClampedArray(W * H * 4);
+  // Reusable upload scratch: grow only if capacity is insufficient.
+  // `data` is a subarray view of exactly needLen, so tf.tensor4d's length check passes.
+  var needLen = H * W * total;
+  if (maskDataBuf === null || maskDataBufLen < needLen) {
+    maskDataBuf = new Float32Array(needLen);
+    maskDataBufLen = needLen;
+  }
+  var data = (maskDataBufLen === needLen) ? maskDataBuf : maskDataBuf.subarray(0, needLen);
+  var imgBuf = maskPreviewBuf; // pre-allocated in initCanvas
   var oc = Math.max(1, Math.min(14, noiseOctaves));
   var spread = Math.max(0, Math.min(1, layerFreqSpread));
   var thr = Math.max(0.02, Math.min(0.98, maskThreshold));
@@ -1023,8 +1044,62 @@ function buildMaskTensor() {
   var noiseRef = noiseSpaceRef();
   var baseWeightGpu = computeBaseWeightsGPU();
   var useGpuBase = !!baseWeightGpu;
-  var brushClaims = brushN > 0 ? new Float32Array(brushN) : null;
-  var brushWeights = brushN > 0 ? new Float32Array(brushN) : null;
+  if (brushN > 0) {
+    if (brushClaimsBuf === null || brushClaimsBuf.length < brushN) {
+      brushClaimsBuf = new Float32Array(brushN);
+      brushWeightsBuf = new Float32Array(brushN);
+    }
+  }
+  var brushClaims = brushN > 0 ? brushClaimsBuf : null;
+  var brushWeights = brushN > 0 ? brushWeightsBuf : null;
+
+  // Fast path: no brushes + GPU base. Skip the brush/argmax/sigmoid branches entirely
+  // and bulk-copy the Y-flipped GPU readback straight into `data`.
+  if (brushN === 0 && useGpuBase) {
+    var qr0 = QUARTILE_RGB[0][0], qr1 = QUARTILE_RGB[1][0], qr2 = QUARTILE_RGB[2][0], qr3 = QUARTILE_RGB[3][0];
+    var qg0 = QUARTILE_RGB[0][1], qg1 = QUARTILE_RGB[1][1], qg2 = QUARTILE_RGB[2][1], qg3 = QUARTILE_RGB[3][1];
+    var qb0 = QUARTILE_RGB[0][2], qb1 = QUARTILE_RGB[1][2], qb2 = QUARTILE_RGB[2][2], qb3 = QUARTILE_RGB[3][2];
+    for (var yf = 0; yf < H; yf++) {
+      var gRowBase = (H - 1 - yf) * W * 4;
+      var dRowBase = yf * W * 4; // total === 4 in this path
+      var idxRow = yf * W;
+      for (var xf = 0; xf < W; xf++) {
+        var gp = gRowBase + xf * 4;
+        var w0f = baseWeightGpu[gp];
+        var w1f = baseWeightGpu[gp + 1];
+        var w2f = baseWeightGpu[gp + 2];
+        var w3f = baseWeightGpu[gp + 3];
+        var dp = dRowBase + xf * 4;
+        data[dp]     = w0f;
+        data[dp + 1] = w1f;
+        data[dp + 2] = w2f;
+        data[dp + 3] = w3f;
+        var rr = w0f * qr0 + w1f * qr1 + w2f * qr2 + w3f * qr3;
+        var gg = w0f * qg0 + w1f * qg1 + w2f * qg2 + w3f * qg3;
+        var bb = w0f * qb0 + w1f * qb1 + w2f * qb2 + w3f * qb3;
+        // Uint8ClampedArray auto-rounds + clamps, so Math.round() is unnecessary.
+        imgBuf[dp]     = rr;
+        imgBuf[dp + 1] = gg;
+        imgBuf[dp + 2] = bb;
+        imgBuf[dp + 3] = 255;
+        var ij = idxRow + xf;
+        cachedMixR[ij] = rr;
+        cachedMixG[ij] = gg;
+        cachedMixB[ij] = bb;
+        cachedNoise01[ij] = 0.25 * (w0f + w1f + w2f + w3f);
+        // cachedQuartile is not read anywhere; skip the argmax in this path.
+      }
+    }
+    // tf.tensor4d copies `data` internally.
+    quartileMaskTensor = tf.tensor4d(data, [1, H, W, total]);
+    if (noisePreviewCanvas.width !== W || noisePreviewCanvas.height !== H) {
+      noisePreviewCanvas.width = W;
+      noisePreviewCanvas.height = H;
+    }
+    noisePreviewCtx.putImageData(maskPreviewImageData, 0, 0);
+    updateNoisePreviewZoom();
+    return;
+  }
 
   for (var y = 0; y < H; y++) {
     for (var x = 0; x < W; x++) {
@@ -1150,10 +1225,13 @@ function buildMaskTensor() {
       cachedMixB[idx] = bb;
     }
   }
+  // tf.tensor4d copies `data` internally, so we can safely reuse the Float32Array next frame.
   quartileMaskTensor = tf.tensor4d(data, [1, H, W, total]);
-  noisePreviewCanvas.width = W;
-  noisePreviewCanvas.height = H;
-  noisePreviewCtx.putImageData(new ImageData(imgBuf, W, H), 0, 0);
+  if (noisePreviewCanvas.width !== W || noisePreviewCanvas.height !== H) {
+    noisePreviewCanvas.width = W;
+    noisePreviewCanvas.height = H;
+  }
+  noisePreviewCtx.putImageData(maskPreviewImageData, 0, 0);
   updateNoisePreviewZoom();
 }
 
@@ -1214,6 +1292,16 @@ function initCanvas() {
   cachedMixR = new Float32Array(W * H);
   cachedMixG = new Float32Array(W * H);
   cachedMixB = new Float32Array(W * H);
+  // Reusable per-frame buffers — re-created when W/H change.
+  maskPreviewBuf = new Uint8ClampedArray(W * H * 4);
+  maskPreviewImageData = new ImageData(maskPreviewBuf, W, H);
+  displayImgData = new ImageData(W, H);
+  // Pre-initialize alpha channel; only RGB gets updated per frame.
+  var dImg = displayImgData.data;
+  for (var ai = 3; ai < dImg.length; ai += 4) dImg[ai] = 255;
+  displayRgbBuf = new Float32Array(W * H * 3);
+  maskDataBuf = null;        // will be (re)allocated lazily once `total` is known
+  maskDataBufLen = 0;
   strokeOrderMap = new Uint32Array(W * H);
   strokeModelMap = new Int32Array(W * H);
   strokeModelMap.fill(-1);
@@ -1335,6 +1423,15 @@ function upscaleSimulation2x() {
     cachedMixR = new Float32Array(W * H);
     cachedMixG = new Float32Array(W * H);
     cachedMixB = new Float32Array(W * H);
+    // Reusable per-frame buffers must also be resized when the grid changes.
+    maskPreviewBuf = new Uint8ClampedArray(W * H * 4);
+    maskPreviewImageData = new ImageData(maskPreviewBuf, W, H);
+    displayImgData = new ImageData(W, H);
+    var dImgU = displayImgData.data;
+    for (var aiu = 3; aiu < dImgU.length; aiu += 4) dImgU[aiu] = 255;
+    displayRgbBuf = new Float32Array(W * H * 3);
+    maskDataBuf = null;
+    maskDataBufLen = 0;
     state = tf.variable(resizedState);
     resizedState.dispose();
 
@@ -1711,7 +1808,7 @@ function setupCanvasDrawing() {
     stampDisk(bm, g[0], g[1], activeStrokeErase, token);
     lastDrawGx = g[0];
     lastDrawGy = g[1];
-    buildMaskTensor();
+    pendingMaskRebuild = true; // coalesced into next render() tick
   });
   window.addEventListener('mousemove', function(e) {
     if (!isDrawingStroke || !drawOnCanvasEnabled) return;
@@ -1728,7 +1825,7 @@ function setupCanvasDrawing() {
     }
     lastDrawGx = g[0];
     lastDrawGy = g[1];
-    buildMaskTensor();
+    pendingMaskRebuild = true; // coalesced into next render() tick
   });
   window.addEventListener('mouseup', function() {
     isDrawingStroke = false;
@@ -1953,6 +2050,11 @@ function render(ts) {
   if (evolveAllBrushMasks()) {
     needRebuildMask = true;
   }
+  // Multiple mousedown/mousemove events since the last frame all coalesce into one rebuild.
+  if (pendingMaskRebuild) {
+    needRebuildMask = true;
+    pendingMaskRebuild = false;
+  }
   if (needRebuildMask) {
     buildMaskTensor();
   }
@@ -1968,35 +2070,37 @@ function render(ts) {
 
   var shouldDisplayFrame = (renderFrame % displayEveryNFrames) === 0;
   if (state && shouldDisplayFrame) {
+    // Pull RGB out of state. Keep the tensor work inside tf.tidy and the resulting
+    // typed array (dataSync view) is safe to use after tidy returns.
+    var rgbSrc = null;
     tf.tidy(function() {
-      // Texture NCA visualization: rgb = state[:,:,:3] / 2 + 0.5
       var rgb = tf.add(state.slice([0,0,0,0], [1,H,W,3]).mul(0.5), 0.5);
       var vis = tf.clipByValue(rgb, 0, 1).mul(255);
-      var data = vis.dataSync();
-      var imgData = new ImageData(W, H);
-      for (var i = 0; i < W * H; i++) {
-        imgData.data[i*4+0] = data[i*3+0];
-        imgData.data[i*4+1] = data[i*3+1];
-        imgData.data[i*4+2] = data[i*3+2];
-        imgData.data[i*4+3] = 255;
-      }
-
-      // Blend overlay (weighted A–E tint, matches preview)
-      if (showMask) {
-        for (var y = 0; y < H; y++) {
-          for (var x = 0; x < W; x++) {
-            var j3 = y * W + x;
-            var a = 0.24;
-            var rr = cachedMixR[j3], gg = cachedMixG[j3], bb = cachedMixB[j3];
-            imgData.data[j3*4+0] = Math.round(imgData.data[j3*4+0] * (1-a) + rr * a);
-            imgData.data[j3*4+1] = Math.round(imgData.data[j3*4+1] * (1-a) + gg * a);
-            imgData.data[j3*4+2] = Math.round(imgData.data[j3*4+2] * (1-a) + bb * a);
-          }
-        }
-      }
-
-      ctx.putImageData(imgData, 0, 0);
+      var view = vis.dataSync(); // Float32Array of length W*H*3
+      // Copy into our reusable buffer so it survives tensor disposal.
+      displayRgbBuf.set(view);
     });
+    rgbSrc = displayRgbBuf;
+
+    var dst = displayImgData.data; // Uint8ClampedArray, alpha already 255
+    var n = W * H;
+    if (showMask) {
+      // Blend overlay (weighted A–E tint, matches preview) — alpha = 0.24.
+      var a = 0.24, oma = 1 - a;
+      for (var i = 0, j = 0, k = 0; i < n; i++, j += 4, k += 3) {
+        dst[j]     = rgbSrc[k]     * oma + cachedMixR[i] * a;
+        dst[j + 1] = rgbSrc[k + 1] * oma + cachedMixG[i] * a;
+        dst[j + 2] = rgbSrc[k + 2] * oma + cachedMixB[i] * a;
+        // dst[j+3] stays 255 (initialized once in initCanvas).
+      }
+    } else {
+      for (var i2 = 0, j2 = 0, k2 = 0; i2 < n; i2++, j2 += 4, k2 += 3) {
+        dst[j2]     = rgbSrc[k2];
+        dst[j2 + 1] = rgbSrc[k2 + 1];
+        dst[j2 + 2] = rgbSrc[k2 + 2];
+      }
+    }
+    ctx.putImageData(displayImgData, 0, 0);
   }
 
   if ((renderFrame % infoEveryNFrames) === 0) {
